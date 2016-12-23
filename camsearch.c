@@ -56,6 +56,7 @@
 " -t <to_ip>                  Specify end of IP range\n"               \
 " -p <port> [-p <port>...]    Specify ports to check\n"                \
 "\nOPTIONAL\n"                                                         \
+" -c <position>               Continue scan at given position\n"       \
 " -r                          Pseudo-randomize IP range\n"             \
 " -T <connect-timeout>        Specify connection timeout (default:"STR(DEFAULT_TIMEOUT)")\n"  \
 " -n <max-threads>            Specify max number of threads (default:"STR(DEFAULT_THREADS)")\n"
@@ -67,7 +68,8 @@
 "Accept: */*\r\n\r\n"
 
 #define IP_SEGMENTS(IP) IP.seg.a, IP.seg.b, IP.seg.c, IP.seg.d
-#define r_fprintf(file, fmt, args...) fprintf(file, fmt"% 60s\r", ##args, "")
+#define SPACES "                                                             "
+#define r_fprintf(file, fmt, args...) fprintf(file, fmt""SPACES"\r", ##args)
 
 typedef union ip_t {
    uint32_t ip;
@@ -108,8 +110,8 @@ static struct linger    socket_linger  = {.l_onoff = 0, .l_linger = 10};
 
 static int              num_ports = 0;
 static uint16_t         *ports = NULL;
+static int              continue_pos = 0;
 
-static union ip_t       last_processed_ip; // for printing last processed ip on exit
 
 int main(int argc, char *argv[])
 {
@@ -121,10 +123,14 @@ int main(int argc, char *argv[])
    {
     opterr = 0;
     int c;
-    while ((c = getopt(argc, argv, "n:f:t:p:T:hr")) != -1)
+    while ((c = getopt(argc, argv, "c:n:f:t:p:T:hr")) != -1)
        switch (c) {
           case 'h':
              return printf(USAGE, argv[0]), 0;
+          case 'c':
+             if (! (continue_pos = atoi(optarg)))
+                errx(1, "invalid parameter for -c: %s\n", optarg);
+             break;
           case 'n':
              if (! (max_threads = atoi(optarg)))
                 errx(1, "invalid parameter for -n: %s\n", optarg);
@@ -155,7 +161,7 @@ int main(int argc, char *argv[])
              fprintf(stderr, USAGE, argv[0]);
              fprintf(stderr, "\n");
 
-             if (strchr("nftpT", optopt))
+             if (strchr("cnftpT", optopt))
                 fprintf(stderr, "Option -%c requires an argument.\n", optopt);
              else if (isprint(optopt))
                 fprintf(stderr, "Unknown option `-%c'.\n", optopt);
@@ -177,12 +183,12 @@ int main(int argc, char *argv[])
        errx(1, "must specify at least one -p <port>");
    }
 
-   // when piping to files, we wan't to see our results immediately, too
+   // when piping to files, we want to see our results immediately, too
    setbuf(stdout, NULL);
 
    sem_init(&thread_count, 0, max_threads);
 
-   printf("# from:%u.%u.%u.%u to:%u.%u.%u.%u threads:%d timeout:%d ports:%d",
+   printf("# from:%u.%u.%u.%u to:%u.%u.%u.%u threads:%d timeout:%ld ports:%d",
            IP_SEGMENTS(start), IP_SEGMENTS(stop), max_threads,
            socket_timeout.tv_sec, ntohs(ports[0]));
    for (int i = 1; i < num_ports; printf(",%u", ntohs(ports[i++])));
@@ -221,7 +227,7 @@ void *disco_thread(void *void_ip)
 
       setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (char*)&socket_timeout, sizeof(socket_timeout));
       setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (char*)&socket_timeout, sizeof(socket_timeout));
-      //setsockopt(sock, SOL_SOCKET, SO_LINGER,   (void*)&socket_linger,  sizeof(socket_lin));  
+      setsockopt(sock, SOL_SOCKET, SO_LINGER,   (void*)&socket_linger,  sizeof(socket_linger));  
       
       if (connect(sock, (struct sockaddr *)&server, sizeof(server)) < 0) {
          close(sock);
@@ -259,6 +265,7 @@ void *disco_thread(void *void_ip)
    }
 
    sem_post(&thread_count);
+   return NULL;
 }
 
 static
@@ -271,12 +278,14 @@ void check_ip(union ip_t ip)
       perror("pthread_create()"), sleep(1);
 
    pthread_detach(t);
-   last_processed_ip = ip;
+   ++continue_pos;
 }
 
 static
 void iterate_ips(union ip_t start, union ip_t stop)
 {
+   start.ip += continue_pos;
+
    while (start.ip++ <= stop.ip) {
       if (start.seg.b == 255 || start.seg.c == 255 || start.seg.d == 255)
          { continue; }
@@ -298,6 +307,8 @@ void randomize_ips(union ip_t start, union ip_t stop)
    ip_t current_ip;
    rand_range_t rand_range;
    rand_range_init(&rand_range, range, 100);
+
+   for (int i = 0; i < continue_pos && rand_range_next(&rand_range, &range_result); ++i);
 
    while (rand_range_next(&rand_range, &range_result)) {
       current_ip.ip = start.ip + range_result;
@@ -363,13 +374,13 @@ void sem_post_all() {
 }
 
 static inline
-void print_last_processed() {
-   fprintf(stderr, "Last processed IP: %u.%u.%u.%u\n", IP_SEGMENTS(last_processed_ip));
+void print_continue_message() {
+   fprintf(stderr, "You can continue the scan by passing '-c %d' to the program\n", continue_pos);
 }
 
 static
 void signal_int_handler(int sig) {
-   print_last_processed();
+   print_continue_message();
    signal(SIGINT, SIG_DFL);
    fprintf(stderr, "Waiting for threads to terminate (press ^C again to force quit) ...\n");
    exit(130); // exit_handler takes care of cleanup
@@ -377,7 +388,6 @@ void signal_int_handler(int sig) {
 
 static
 void signal_term_handler(int sig) {
-   print_last_processed();
    exit(0);
 }
 
@@ -389,7 +399,7 @@ void signal_cont_handler(int sig) {
 
 static
 void signal_tstp_handler(int sig) {
-   print_last_processed();
+   print_continue_message();
    sem_wait_all();
    fprintf(stderr, "Sleeping...\n");
    raise(SIGSTOP); // note: SIGSTOP, not SIGTSTP
